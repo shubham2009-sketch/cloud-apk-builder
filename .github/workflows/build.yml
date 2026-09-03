@@ -1,0 +1,218 @@
+name: Build Android APK
+run-name: Build ${{ github.event.client_payload.build_id || github.event.inputs.build_id || 'APK' }}
+
+on:
+  repository_dispatch:
+    types: [build_apk]
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID'
+        required: false
+        default: 'MANUAL_TRIGGER'
+      build_variant:
+        description: 'Build Variant (release or debug)'
+        required: false
+        default: 'release'
+
+jobs:
+  build:
+    name: Build Android APK Artifact
+    runs-on: ubuntu-latest
+    env:
+      BUILD_ID: ${{ github.event.client_payload.build_id || github.event.inputs.build_id || 'UNKNOWN' }}
+      ZIP_URL: ${{ github.event.client_payload.zip_url || github.event.inputs.zip_url || '' }}
+      BUILD_VARIANT: ${{ github.event.client_payload.build_variant || github.event.inputs.build_variant || 'release' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download and Extract Uploaded Project
+        run: |
+          if [ -n "$ZIP_URL" ]; then
+            echo "Downloading source archive from $ZIP_URL"
+            if [[ "$ZIP_URL" == https://github.com/* ]] || [[ "$ZIP_URL" == https://api.github.com/* ]]; then
+              curl -L -f -sS -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o project.zip "$ZIP_URL" || { echo "Download failed"; exit 1; }
+            elif [[ "$ZIP_URL" == https://* ]]; then
+              curl -L -f -sS -o project.zip "$ZIP_URL" || { echo "Download failed"; exit 1; }
+            else
+              echo "[FATAL] Untrusted URL scheme rejected."
+              exit 1
+            fi
+            mkdir target_project
+            unzip -q project.zip -d target_project || { echo "[FATAL] ZIP extraction failed"; exit 1; }
+          else
+            echo "No zip_url provided, building repository root."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Locate Android Project Root and Dynamically Configure Gradle Compatibility
+        run: |
+          set -e
+          WORK_DIR="."
+          if [ -n "$ZIP_URL" ]; then
+            WORK_DIR="target_project"
+            # Discover nested Android root containing settings.gradle or build.gradle
+            if [ ! -f "target_project/settings.gradle" ] && [ ! -f "target_project/settings.gradle.kts" ] && [ ! -f "target_project/build.gradle" ] && [ ! -f "target_project/build.gradle.kts" ]; then
+              FOUND_DIR=$(find target_project -maxdepth 3 -name "settings.gradle*" -o -name "build.gradle*" | head -n 1 | xargs dirname || true)
+              if [ -n "$FOUND_DIR" ]; then
+                WORK_DIR="$FOUND_DIR"
+              fi
+            fi
+          fi
+          echo "PROJECT_DIR=$WORK_DIR" >> $GITHUB_ENV
+          echo "Android Project Directory: $WORK_DIR"
+
+          # 1. Check if uploaded project already has a complete, valid Gradle Wrapper
+          HAS_WRAPPER=false
+          if [ -f "$WORK_DIR/gradlew" ] && [ -f "$WORK_DIR/gradle/wrapper/gradle-wrapper.jar" ] && [ -f "$WORK_DIR/gradle/wrapper/gradle-wrapper.properties" ]; then
+            if grep -q "distributionUrl" "$WORK_DIR/gradle/wrapper/gradle-wrapper.properties"; then
+              HAS_WRAPPER=true
+              echo "[INFO] Existing valid Gradle Wrapper detected in project. Preserving existing wrapper."
+            fi
+          fi
+
+          # 2. If wrapper is missing or incomplete, dynamically determine AGP and compatible Gradle version
+          if [ "$HAS_WRAPPER" = false ]; then
+            echo "[INFO] Gradle Wrapper missing or incomplete. Dynamically determining AGP version..."
+
+            DETECTED_AGP=""
+            # Search for AGP in version catalogs (.versions.toml)
+            for toml in $(find "$WORK_DIR" -maxdepth 4 -name "*.versions.toml"); do
+              AGP_MATCH=$(grep -E '(agp|androidGradlePlugin|androidToolsBuild|androidPlugin|android-gradle-plugin|com-android-application|android)\s*=' "$toml" | head -n 1 | sed -E 's/.*=\s*["'\''\\]*([^"'\'']+).*/\1/' || true)
+              if [ -n "$AGP_MATCH" ]; then
+                DETECTED_AGP="$AGP_MATCH"
+                echo "Found AGP in $toml: $DETECTED_AGP"
+                break
+              fi
+            done
+
+            # Search in build.gradle / build.gradle.kts
+            if [ -z "$DETECTED_AGP" ]; then
+              for gfile in $(find "$WORK_DIR" -maxdepth 4 -name "build.gradle*" -o -name "settings.gradle*"); do
+                AGP_MATCH=$(grep -oE 'com\.android\.(application|library).*version\s*["'\''][0-9a-zA-Z\.\-]+["'\'']' "$gfile" | head -n 1 | sed -E 's/.*version\s*["'\'']([^"'\'']+)["'\''].*/\1/' || true)
+                if [ -n "$AGP_MATCH" ]; then
+                  DETECTED_AGP="$AGP_MATCH"
+                  echo "Found AGP in $gfile: $DETECTED_AGP"
+                  break
+                fi
+                AGP_CP_MATCH=$(grep -oE 'com\.android\.tools\.build:gradle:[0-9a-zA-Z\.\-]+' "$gfile" | head -n 1 | sed -E 's/com\.android\.tools\.build:gradle://' || true)
+                if [ -n "$AGP_CP_MATCH" ]; then
+                  DETECTED_AGP="$AGP_CP_MATCH"
+                  echo "Found AGP classpath in $gfile: $DETECTED_AGP"
+                  break
+                fi
+              done
+            fi
+
+            # Determine compatible Gradle version based on AGP
+            TARGET_GRADLE=""
+            if [ -n "$DETECTED_AGP" ]; then
+              echo "Detected Android Gradle Plugin (AGP) version: $DETECTED_AGP"
+              MAJOR=$(echo "$DETECTED_AGP" | cut -d. -f1)
+              MINOR=$(echo "$DETECTED_AGP" | cut -d. -f2)
+
+              if [ "$MAJOR" -ge 9 ]; then
+                TARGET_GRADLE="9.3.1"
+              elif [ "$MAJOR" -eq 8 ]; then
+                if [ "$MINOR" -ge 6 ]; then
+                  TARGET_GRADLE="8.10.2"
+                elif [ "$MINOR" -ge 4 ]; then
+                  TARGET_GRADLE="8.7"
+                elif [ "$MINOR" -ge 2 ]; then
+                  TARGET_GRADLE="8.4"
+                else
+                  TARGET_GRADLE="8.2"
+                fi
+              elif [ "$MAJOR" -eq 7 ]; then
+                if [ "$MINOR" -ge 4 ]; then
+                  TARGET_GRADLE="7.6.4"
+                elif [ "$MINOR" -ge 3 ]; then
+                  TARGET_GRADLE="7.5.1"
+                else
+                  TARGET_GRADLE="7.3.3"
+                fi
+              else
+                echo "[FATAL] Unsupported or legacy AGP version ($DETECTED_AGP). Cannot safely map Gradle version."
+                exit 1
+              fi
+            else
+              echo "[FATAL] Could not determine AGP version in uploaded project. Refusing unsafe fixed-version guess."
+              exit 1
+            fi
+
+            echo "[SUCCESS] Selected compatible Gradle version: $TARGET_GRADLE"
+
+            # Provision wrapper infrastructure
+            mkdir -p "$WORK_DIR/gradle/wrapper"
+            if [ ! -f "$WORK_DIR/gradlew" ]; then
+              if [ -f "./gradlew" ]; then
+                cp ./gradlew "$WORK_DIR/gradlew"
+              else
+                echo "[FATAL] Missing trusted gradlew template file in repository."
+                exit 1
+              fi
+            fi
+
+            if [ ! -f "$WORK_DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+              if [ -f "./gradle/wrapper/gradle-wrapper.jar" ]; then
+                cp ./gradle/wrapper/gradle-wrapper.jar "$WORK_DIR/gradle/wrapper/gradle-wrapper.jar"
+              else
+                echo "[FATAL] Missing trusted gradle-wrapper.jar in repository."
+                exit 1
+              fi
+            fi
+
+            # Write dynamically matched gradle-wrapper.properties
+            cat <<EOF > "$WORK_DIR/gradle/wrapper/gradle-wrapper.properties"
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-${TARGET_GRADLE}-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+EOF
+            echo "[INFO] Dynamically generated gradle-wrapper.properties for Gradle $TARGET_GRADLE"
+          fi
+
+          # Ensure gradlew has executable permissions
+          chmod +x "$WORK_DIR/gradlew"
+
+      - name: Run Real Gradle Build
+        run: |
+          set -e
+          cd "${{ env.PROJECT_DIR }}"
+
+          # Verify Gradle Wrapper exists and is executable
+          if [ ! -f "./gradlew" ] || [ ! -x "./gradlew" ]; then
+            echo "[FATAL] Gradle Wrapper executable missing or not runnable in project directory."
+            exit 1
+          fi
+
+          # STRICT RULE: NEVER fall back to system 'gradle'. Execute only wrapper!
+          if [ "${{ env.BUILD_VARIANT }}" = "debug" ]; then
+            echo "Executing assembleDebug via Gradle Wrapper..."
+            ./gradlew clean assembleDebug --no-daemon --stacktrace
+          else
+            echo "Executing assembleRelease via Gradle Wrapper..."
+            ./gradlew clean assembleRelease --no-daemon --stacktrace
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_ID }}-apk
+          path: |
+            ${{ env.PROJECT_DIR }}/**/build/outputs/apk/**/*.apk
+          retention-days: 1
